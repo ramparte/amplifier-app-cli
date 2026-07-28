@@ -6,6 +6,8 @@ import asyncio
 import json
 import sys
 from collections.abc import Callable
+from dataclasses import dataclass
+from dataclasses import field
 from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
@@ -41,6 +43,165 @@ try:
     HAS_SESSION_FORK = True
 except ImportError:
     HAS_SESSION_FORK = False
+
+
+@dataclass
+class ChangeProviderResult:
+    """Outcome of migrating a session to a different provider/model."""
+
+    session_id: str
+    old_model: str | None
+    new_model: str
+    changed: bool
+    provider_changed: bool
+    thinking_blocks_stripped: int
+    backup_paths: list[Path] = field(default_factory=list)
+
+
+def parse_provider_model(target: str) -> tuple[str, str]:
+    """Parse a canonical 'provider/model' target argument.
+
+    Raises ValueError with a helpful message for bare model names.
+    """
+    provider_part, sep, model_part = target.partition("/")
+    if not sep or not provider_part or not model_part:
+        raise ValueError(
+            f"Invalid target '{target}': expected canonical 'provider/model' "
+            "(e.g. anthropic/claude-opus-4-8). A bare model name is not enough "
+            "to determine the target provider."
+        )
+    return provider_part, model_part
+
+
+def strip_thinking_blocks(transcript: list) -> tuple[list, int]:
+    """Remove all assistant thinking content blocks from a transcript.
+
+    Returns (new_transcript, number_of_blocks_removed). Only list-shaped
+    assistant message content can contain thinking blocks; string content is
+    left untouched.
+    """
+    stripped_count = 0
+    new_transcript = []
+    for message in transcript:
+        if (
+            isinstance(message, dict)
+            and message.get("role") == "assistant"
+            and isinstance(message.get("content"), list)
+        ):
+            kept_blocks = []
+            for block in message["content"]:
+                if isinstance(block, dict) and block.get("type") == "thinking":
+                    stripped_count += 1
+                else:
+                    kept_blocks.append(block)
+            if stripped_count and len(kept_blocks) != len(message["content"]):
+                message = {**message, "content": kept_blocks}
+        new_transcript.append(message)
+    return new_transcript, stripped_count
+
+
+def _backup_session_files(session_dir: Path) -> list[Path]:
+    """Snapshot transcript.jsonl and metadata.json as timestamped siblings.
+
+    Created BEFORE any modification. Raises RuntimeError (nothing modified)
+    if any backup copy fails.
+    """
+    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")
+    backups: list[Path] = []
+    for filename in ("transcript.jsonl", "metadata.json"):
+        source = session_dir / filename
+        if not source.exists():
+            continue
+        destination = session_dir / f"{filename}.bak-{timestamp}"
+        try:
+            import shutil
+
+            shutil.copy2(source, destination)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Backup failed for {source}: {exc}. Session left unmodified."
+            ) from exc
+        backups.append(destination)
+    return backups
+
+
+def change_session_provider(
+    store: SessionStore, session_id: str, target: str
+) -> ChangeProviderResult:
+    """Migrate a persisted session so it can resume under a different provider.
+
+    - Backs up transcript.jsonl and metadata.json (timestamped) before any change.
+    - Strips ALL assistant thinking blocks when the provider changes (cross-provider
+      thinking blocks are never replayable; unsigned ones cause Anthropic 400s).
+    - Leaves the transcript untouched for same-provider model-only changes.
+    - Updates metadata["model"] and appends the prior value to metadata["model_history"].
+    - Idempotent: same target twice is a no-op.
+    """
+    from ..incremental_save import updated_model_history
+    from .run import _normalize_provider, _split_saved_model
+
+    new_provider, _new_model_name = parse_provider_model(target)
+
+    metadata = store.get_metadata(session_id)
+    old_model = metadata.get("model")
+
+    old_provider: str | None = None
+    old_model_name: str | None = None
+    if old_model and old_model != "unknown":
+        old_provider, old_model_name = _split_saved_model(old_model)
+
+    # Idempotency: same provider (normalized) and same model -> no-op.
+    if (
+        old_provider is not None
+        and _normalize_provider(old_provider) == _normalize_provider(new_provider)
+        and old_model_name == _new_model_name
+    ):
+        return ChangeProviderResult(
+            session_id=session_id,
+            old_model=old_model,
+            new_model=target,
+            changed=False,
+            provider_changed=False,
+            thinking_blocks_stripped=0,
+            backup_paths=[],
+        )
+
+    # Provider changes when the saved provider differs or is unknown
+    # (conservative: unknown provenance means thinking blocks may not replay).
+    provider_changed = old_provider is None or _normalize_provider(
+        old_provider
+    ) != _normalize_provider(new_provider)
+
+    # Backups BEFORE any modification; abort cleanly on failure.
+    session_dir = store.base_dir / session_id
+    backup_paths = _backup_session_files(session_dir)
+
+    history = updated_model_history(metadata, target)
+
+    stripped_count = 0
+    if provider_changed:
+        transcript, _ = store.load(session_id)
+        transcript, stripped_count = strip_thinking_blocks(transcript)
+        new_metadata = {**metadata, "model": target}
+        if history:
+            new_metadata["model_history"] = history
+        store.save(session_id, transcript, new_metadata)
+    else:
+        # Same provider, different model: metadata only, transcript untouched.
+        updates: dict = {"model": target}
+        if history:
+            updates["model_history"] = history
+        store.update_metadata(session_id, updates)
+
+    return ChangeProviderResult(
+        session_id=session_id,
+        old_model=old_model,
+        new_model=target,
+        changed=True,
+        provider_changed=provider_changed,
+        thinking_blocks_stripped=stripped_count,
+        backup_paths=backup_paths,
+    )
 
 
 def _record_bundle_override(
@@ -984,6 +1145,65 @@ def register_session_commands(
         except Exception as exc:
             console.print(f"[red]Error deleting session:[/red] {exc}")
             sys.exit(1)
+
+    @session.command(name="change-provider")
+    @click.argument("session_id")
+    @click.argument("target")
+    def sessions_change_provider(session_id: str, target: str):
+        """Migrate a session to a different provider/model.
+
+        TARGET is the canonical 'provider/model' form
+        (e.g. anthropic/claude-opus-4-8).
+
+        Backs up transcript.jsonl and metadata.json inside the session
+        directory before touching anything, strips assistant thinking blocks
+        when the provider changes, and updates metadata model/model_history
+        so the session can be resumed under the new provider.
+        """
+        store = SessionStore()
+
+        try:
+            session_id = store.find_session(session_id)
+        except FileNotFoundError:
+            console.print(f"[red]Error:[/red] No session found matching '{session_id}'")
+            sys.exit(1)
+        except ValueError as e:
+            console.print(f"[red]Error:[/red] {e}")
+            sys.exit(1)
+
+        try:
+            result = change_session_provider(store, session_id, target)
+        except (ValueError, RuntimeError) as e:
+            console.print(f"[red]Error:[/red] {e}")
+            sys.exit(1)
+        except Exception as exc:
+            console.print(f"[red]Error changing provider:[/red] {exc}")
+            sys.exit(1)
+
+        if not result.changed:
+            console.print(
+                f"[yellow]No changes:[/yellow] session '{session_id}' already "
+                f"targets '{target}'."
+            )
+            return
+
+        console.print(
+            f"[green]\u2713[/green] Session '{session_id}' migrated: "
+            f"{result.old_model or 'unknown'} \u2192 {result.new_model}"
+        )
+        for backup_path in result.backup_paths:
+            console.print(f"  Backup: {backup_path}")
+        if result.provider_changed:
+            console.print(
+                f"  Thinking blocks stripped: {result.thinking_blocks_stripped}"
+            )
+        else:
+            console.print(
+                "  Transcript untouched (same provider, model-only change)"
+            )
+        console.print(
+            f"  Next: resume with [cyan]amplifier session resume {session_id}[/cyan]"
+        )
 
     @session.command(name="resume")
     @click.argument("session_id")

@@ -251,6 +251,10 @@ class CommandProcessor:
             "action": "clear_context",
             "description": "Clear conversation context",
         },
+        "/compact": {
+            "action": "compact_context",
+            "description": "Compact conversation context to free token space",
+        },
         "/help": {"action": "show_help", "description": "Show available commands"},
         "/config": {
             "action": "show_config",
@@ -406,6 +410,9 @@ class CommandProcessor:
         if action == "clear_context":
             await self._clear_context()
             return "✓ Context cleared"
+
+        if action == "compact_context":
+            return await self._compact_context()
 
         if action == "show_help":
             return self._format_help()
@@ -618,6 +625,23 @@ class CommandProcessor:
             messages = await context.get_messages()
             lines.append(f"  Messages: {len(messages)}")
 
+        # Context token pressure (if the context manager reports usage)
+        if context and hasattr(context, "usage_report"):
+            try:
+                report = context.usage_report(provider=self._select_provider())
+                pct = report["pct"] * 100
+                lines.append(
+                    f"  Context: ~{report['tokens']:,}/{report['budget']:,} tokens ({pct:.0f}%)"
+                )
+                if report["tokens"] >= report["threshold_tokens"]:
+                    lines.append(
+                        "  ⚠ Context is full — run /compact to free space (auto-compaction is also active)."
+                    )
+                elif pct >= 75:
+                    lines.append("  ⚠ Context is getting full — consider /compact.")
+            except Exception:
+                pass  # Never let status reporting fail the command
+
         # Active providers
         providers = self.session.coordinator.get("providers")
         if providers:
@@ -636,6 +660,77 @@ class CommandProcessor:
         context = self.session.coordinator.get("context")
         if context and hasattr(context, "clear"):
             await context.clear()
+
+    def _select_provider(self):
+        """Pick the highest-priority provider (lower number = higher priority).
+
+        Mirrors the orchestrator's selection so budget/token math matches what
+        the model actually sees. Returns None when no providers are mounted.
+        """
+        providers = self.session.coordinator.get("providers") or {}
+        best = None
+        best_priority = None
+        for provider in providers.values():
+            priority = 100
+            if hasattr(provider, "priority"):
+                priority = provider.priority
+            elif hasattr(provider, "config") and isinstance(provider.config, dict):
+                priority = provider.config.get("priority", 100)
+            if best_priority is None or priority < best_priority:
+                best_priority = priority
+                best = provider
+        return best
+
+    async def _compact_context(self) -> str:
+        """Explicitly (persistently) compact the conversation context.
+
+        Runs the context manager's real compact() against stored history and
+        reports before/after token + message counts.
+        """
+        context = self.session.coordinator.get("context")
+        if not context or not hasattr(context, "compact"):
+            return "Compaction is not supported by the active context manager."
+
+        provider = self._select_provider()
+        try:
+            stats = await context.compact(provider=provider, force=True)
+        except TypeError:
+            # Older context managers expose a no-arg compact(); fall back.
+            result = await context.compact()
+            stats = result if isinstance(result, dict) else None
+        except Exception as e:  # pragma: no cover - defensive
+            return f"Compaction failed: {e}"
+
+        if not isinstance(stats, dict):
+            return "✓ Context compacted."
+
+        if not stats.get("compacted"):
+            reason = stats.get("reason", "nothing to do")
+            pretty = {
+                "below_threshold": "context is not full yet",
+                "already_compact": "context is already at/under the compaction target",
+            }.get(reason, reason)
+            before = stats.get("before_tokens")
+            budget = stats.get("budget")
+            suffix = ""
+            if before is not None and budget:
+                suffix = f" (~{before:,}/{budget:,} tokens)"
+            return f"Nothing to compact — {pretty}{suffix}."
+
+        bt = stats.get("before_tokens", 0)
+        at = stats.get("after_tokens", 0)
+        bm = stats.get("before_messages", 0)
+        am = stats.get("after_messages", 0)
+        saved = max(bt - at, 0)
+        pct = (saved / bt * 100) if bt else 0.0
+        level = stats.get("strategy_level")
+        line = (
+            f"✓ Compacted context: {bm} → {am} messages, "
+            f"~{bt:,} → ~{at:,} tokens (freed ~{saved:,}, {pct:.0f}%)"
+        )
+        if level:
+            line += f" [strategy level {level}]"
+        return line
 
     async def _rename_session(self, new_name: str) -> str:
         """Rename the current session."""
@@ -1429,12 +1524,18 @@ async def interactive_chat(
 
     # Helper to save session after each turn
     async def _save_session():
+        from .incremental_save import updated_model_history
+
         context = session.coordinator.get("context")
         if context and hasattr(context, "get_messages"):
             messages = await context.get_messages()
             # Load existing metadata to preserve fields like name, description
             # that may have been set by other hooks (e.g., session-naming)
             existing_metadata = store.get_metadata(actual_session_id) or {}
+            model_name = _extract_model_name()
+            # Preserve provenance: when the model changes across saves the
+            # previous value goes to model_history instead of being destroyed
+            model_history = updated_model_history(existing_metadata, model_name)
             metadata = {
                 **existing_metadata,  # Preserve name, description, etc.
                 "session_id": actual_session_id,
@@ -1442,11 +1543,13 @@ async def interactive_chat(
                     "created", datetime.now(UTC).isoformat()
                 ),
                 "bundle": bundle_name,
-                "model": _extract_model_name(),
+                "model": model_name,
                 "turn_count": len([m for m in messages if m.get("role") == "user"]),
                 # Store working_dir for session sync between CLI and web
                 "working_dir": str(Path.cwd().resolve()),
             }
+            if model_history:
+                metadata["model_history"] = model_history
             store.save(actual_session_id, messages, metadata)
 
     # Helper to execute a prompt with Ctrl+C handling
@@ -1606,7 +1709,16 @@ async def interactive_chat(
                 display_validation_error(console, e, verbose=verbose)
 
             except Exception as e:
-                console.print(f"[red]Error:[/red] {e}")
+                # Backstop: translate thinking-block/signature InvalidRequestError
+                # 400s (typical symptom of a cross-provider resume) into a
+                # friendly message, mirroring execute_single's catch-all handler.
+                from .utils.error_format import format_cross_provider_resume_error
+
+                cross_provider_hint = format_cross_provider_resume_error(e)
+                if cross_provider_hint:
+                    console.print(f"[red]Error:[/red] {cross_provider_hint}")
+                else:
+                    console.print(f"[red]Error:[/red] {e}")
                 if verbose:
                     console.print_exception()
 
@@ -1792,6 +1904,11 @@ async def execute_single(
             # Load existing metadata to preserve fields like name, description
             # that may have been set by other hooks (e.g., session-naming)
             existing_metadata = store.get_metadata(actual_session_id) or {}
+            # Preserve model provenance across saves (same rule as
+            # IncrementalSaveHook): previous model goes to model_history
+            from .incremental_save import updated_model_history
+
+            model_history = updated_model_history(existing_metadata, model_name)
             metadata = {
                 **existing_metadata,  # Preserve name, description, etc.
                 "session_id": actual_session_id,
@@ -1804,6 +1921,8 @@ async def execute_single(
                 # Store working_dir for session sync between CLI and web
                 "working_dir": str(Path.cwd().resolve()),
             }
+            if model_history:
+                metadata["model_history"] = model_history
             store.save(actual_session_id, messages, metadata)
             if verbose and output_format == "text":
                 console.print(f"[dim]Session {actual_session_id[:8]}... saved[/dim]")
@@ -1827,6 +1946,11 @@ async def execute_single(
         sys.exit(1)
 
     except Exception as e:
+        # Backstop: translate thinking-block/signature InvalidRequestError 400s
+        # (typical symptom of a cross-provider resume) into a friendly message
+        from .utils.error_format import format_cross_provider_resume_error
+
+        cross_provider_hint = format_cross_provider_resume_error(e)
         if output_format in ["json", "json-trace"]:
             # Restore stdout before writing error JSON
             if original_stdout is not None:
@@ -1838,10 +1962,17 @@ async def execute_single(
                 "session_id": session.session_id,
                 "timestamp": datetime.now(UTC).isoformat(),
             }
+            if cross_provider_hint:
+                error_output["hint"] = cross_provider_hint
             print(json.dumps(error_output, indent=2))
         else:
+            if cross_provider_hint:
+                # Human-readable explanation pointing at cross-provider resume
+                console.print(f"[red]Error:[/red] {cross_provider_hint}")
+                if verbose:
+                    console.print_exception()
             # Try clean display for module validation errors (including wrapped ones)
-            if not display_validation_error(console, e, verbose=verbose):
+            elif not display_validation_error(console, e, verbose=verbose):
                 # Fall back to generic error output
                 console.print(f"[red]Error:[/red] {e}")
                 if verbose:

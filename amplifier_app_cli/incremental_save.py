@@ -23,6 +23,37 @@ from .session_store import SessionStore
 logger = logging.getLogger(__name__)
 
 
+def updated_model_history(
+    existing_metadata: dict[str, Any], new_model: str
+) -> list[str]:
+    """Compute the model_history list for a metadata save.
+
+    Preserves provenance: when the persisted model changes across saves,
+    the previous value is appended to model_history instead of being
+    silently destroyed. metadata["model"] stays the *current* model;
+    metadata["model_history"] accumulates prior values.
+
+    Args:
+        existing_metadata: Metadata dict as previously persisted (may be empty)
+        new_model: The model name about to be written to metadata["model"]
+
+    Returns:
+        The (possibly unchanged) model_history list. Empty list means
+        no history to record.
+    """
+    history_value = existing_metadata.get("model_history")
+    history = list(history_value) if isinstance(history_value, list) else []
+    previous = existing_metadata.get("model")
+    if (
+        previous
+        and previous != "unknown"
+        and previous != new_model
+        and (not history or history[-1] != previous)
+    ):
+        history.append(previous)
+    return history
+
+
 class IncrementalSaveHook:
     """Hook that saves session transcript after each tool completion.
 
@@ -102,6 +133,10 @@ class IncrementalSaveHook:
             # that may have been set by other hooks (e.g., session-naming)
             existing_metadata = self.store.get_metadata(self.session_id) or {}
 
+            # Preserve model provenance: append the previous model to
+            # model_history when it changes across saves (never destroy it)
+            model_history = updated_model_history(existing_metadata, model_name)
+
             # Build metadata, preserving existing fields while updating dynamic ones
             metadata = {
                 **existing_metadata,  # Preserve name, description, etc.
@@ -116,6 +151,8 @@ class IncrementalSaveHook:
                 # Store working_dir for session sync between CLI and web
                 "working_dir": str(Path.cwd().resolve()),
             }
+            if model_history:
+                metadata["model_history"] = model_history
 
             # Save via SessionStore (atomic writes)
             self.store.save(self.session_id, messages, metadata)

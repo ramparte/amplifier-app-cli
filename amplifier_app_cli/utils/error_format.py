@@ -70,6 +70,45 @@ def format_error_message(e: BaseException, *, include_type: bool = True) -> str:
     return f"{error_type}: (no additional details)"
 
 
+def format_cross_provider_resume_error(e: BaseException) -> str | None:
+    """Translate thinking-block/signature 400s into a friendly explanation.
+
+    Providers reject transcripts containing extended-thinking blocks that were
+    produced by a *different* provider/model (their signatures fail
+    validation), surfacing as a cryptic InvalidRequestError 400 mentioning
+    "thinking" and/or "signature". This detects that shape and points the user
+    at cross-provider resume as the likely cause.
+
+    Args:
+        e: The exception to inspect
+
+    Returns:
+        Human-readable explanation string, or None if the error does not
+        look like a cross-provider resume failure.
+    """
+    error_text = str(e)
+    haystack = f"{type(e).__name__}: {error_text}".lower()
+
+    compact = haystack.replace("_", "").replace(" ", "")
+    looks_like_bad_request = (
+        "invalidrequest" in compact or "400" in haystack or "bad request" in haystack
+    )
+    mentions_thinking_signature = "thinking" in haystack or "signature" in haystack
+    if not (looks_like_bad_request and mentions_thinking_signature):
+        return None
+
+    return (
+        f"{error_text}\n\n"
+        "This usually means the session was resumed under a different provider "
+        "than the one that created it: thinking blocks in the transcript carry "
+        "provider-specific signatures that other providers reject with a 400 error.\n"
+        "To fix, resume the session with its original provider:\n"
+        "  amplifier run --resume <session-id> --provider <original-provider> --model <original-model>\n"
+        "(The session's original model is recorded in its metadata.json under "
+        "'model' / 'model_history'.)"
+    )
+
+
 def print_error(console: "Console", e: BaseException, *, verbose: bool = False) -> None:
     """Print an error to the console with proper formatting.
 

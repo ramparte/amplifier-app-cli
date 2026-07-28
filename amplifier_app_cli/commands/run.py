@@ -34,6 +34,113 @@ from ..types import (
 logger = logging.getLogger(__name__)
 
 
+def _split_saved_model(saved_model: str) -> tuple[str | None, str]:
+    """Split a persisted metadata model value into (provider, model_name).
+
+    Saved values come in three shapes:
+        "anthropic/claude-opus-4-6" -> ("anthropic", "claude-opus-4-6")
+            (mount-name form, written by main.py's final save)
+        "provider-anthropic/claude-opus-4-6" -> ("provider-anthropic", "claude-opus-4-6")
+        "claude-opus-4-6" -> (None, "claude-opus-4-6")
+            (bare model, written by incremental saves)
+    """
+    if "/" in saved_model:
+        provider_part, model_part = saved_model.split("/", 1)
+        return provider_part, model_part
+    return None, saved_model
+
+
+def _normalize_provider(provider: str) -> str:
+    """Normalize a provider identifier for comparison.
+
+    Persisted metadata records the provider as a mount name ("anthropic")
+    while resolved config uses module ids ("provider-anthropic"). Both
+    normalize to "anthropic" so same-provider resumes compare equal.
+    """
+    return provider.removeprefix("provider-")
+
+
+def _resolve_active_provider(config_data: dict) -> tuple[str | None, str | None]:
+    """Return (provider_module, model_name) for the highest-precedence provider.
+
+    The active provider is the entry with the lowest ``priority`` value
+    (default 100) in config_data["providers"] — mirrors the CLI override logic.
+    """
+    providers_list = config_data.get("providers", [])
+    best_entry: dict | None = None
+    best_priority = float("inf")
+    for entry in providers_list:
+        if not isinstance(entry, dict):
+            continue
+        entry_config = entry.get("config")
+        priority = (
+            entry_config.get("priority", 100) if isinstance(entry_config, dict) else 100
+        )
+        if priority < best_priority:
+            best_priority = priority
+            best_entry = entry
+    if best_entry is None:
+        return None, None
+    entry_config = best_entry.get("config")
+    model_name = None
+    if isinstance(entry_config, dict):
+        model_name = entry_config.get("model") or entry_config.get("default_model")
+    return best_entry.get("module"), model_name
+
+
+def build_resume_mismatch_warning(
+    saved_model: str | None, config_data: dict, session_id: str
+) -> str | None:
+    """Detect a cross-provider resume and build an actionable warning.
+
+    Compares the session's persisted model (metadata.json "model") against the
+    provider/model about to be used. Returns a warning message naming both
+    models and the exact flags to resume with the original provider, or None
+    when they match (or when there is not enough information to compare).
+
+    This is warn-and-continue: callers must not block the resume.
+    """
+    if not saved_model or saved_model == "unknown":
+        return None
+
+    current_module, current_model = _resolve_active_provider(config_data)
+    if current_module is None:
+        return None
+
+    saved_provider, saved_model_name = _split_saved_model(saved_model)
+
+    if saved_provider is not None:
+        # Provider recorded: warn only when resuming under a different provider.
+        # Compare normalized names: metadata stores mount names ("anthropic")
+        # while config uses module ids ("provider-anthropic").
+        mismatch = _normalize_provider(saved_provider) != _normalize_provider(
+            current_module
+        )
+    else:
+        # Only the bare model name recorded: a different model is the best
+        # available signal that a different provider may be in play
+        mismatch = current_model is not None and saved_model_name != current_model
+    if not mismatch:
+        return None
+
+    provider_flag = (saved_provider or "<original-provider>").removeprefix("provider-")
+    current_display = (
+        f"{current_module}/{current_model}" if current_model else current_module
+    )
+    return (
+        "This session was created with a different provider/model.\n"
+        f"  Session model:  {saved_model}\n"
+        f"  About to use:   {current_display}\n"
+        "\n"
+        "Resuming under a different provider can fail with a cryptic\n"
+        "provider 400 error (e.g. invalid thinking-block signatures).\n"
+        "To resume with the original provider, run:\n"
+        "\n"
+        f"  amplifier run --resume {session_id} "
+        f"--provider {provider_flag} --model {saved_model_name}"
+    )
+
+
 def register_run_command(
     cli: click.Group,
     *,
@@ -311,6 +418,24 @@ def register_run_command(
                 # CRITICAL: Update the prepared bundle's mount plan with modified providers
                 if prepared_bundle and hasattr(prepared_bundle, "mount_plan"):
                     prepared_bundle.mount_plan["providers"] = updated_providers
+
+        # Cross-provider resume check: warn (but never block) when the session
+        # was produced by a different provider than the one about to be used.
+        # Placed after CLI overrides so --provider/--model suppress the warning.
+        if resume and metadata:
+            mismatch_warning = build_resume_mismatch_warning(
+                metadata.get("model"), config_data, resume
+            )
+            if mismatch_warning:
+                console.print()
+                console.print(
+                    Panel(
+                        mismatch_warning,
+                        title="[bold black on yellow] Provider mismatch on resume [/bold black on yellow]",
+                        border_style="yellow",
+                        padding=(1, 2),
+                    )
+                )
 
         # Run update check (uses unified startup_checker with settings.yaml)
         from ..utils.startup_checker import check_and_notify
